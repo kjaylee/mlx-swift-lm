@@ -36,7 +36,7 @@ let package = Package(
             targets: ["IntegrationTestHelpers"]),
     ],
     dependencies: [
-        .package(url: "https://github.com/kjaylee/mlx-swift.git", branch: "codex/merge-prism-1bit"),
+        .package(url: "https://github.com/kjaylee/mlx-swift.git", branch: "codex/fix-quantizedlinear-mode"),
         .package(
             url: "https://github.com/huggingface/swift-transformers",
             .upToNextMinor(from: "1.2.0")
