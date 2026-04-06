@@ -931,6 +931,27 @@ public class Gemma4Model: Module, LLMModel {
             ))
         }
 
+        if
+            finalWeights["model.embed_tokens_per_layer.scales"] != nil,
+            let perLayerEmbedWeight = finalWeights["model.embed_tokens_per_layer.weight"],
+            let embedTokensPerLayer = model.embedTokensPerLayer as? Embedding
+        {
+            let quantization = quantizationParameters(
+                for: "model.embed_tokens_per_layer",
+                packedWeight: perLayerEmbedWeight,
+                inputDimensions: embedTokensPerLayer.weight.shape[1]
+            )
+            moduleUpdates.append((
+                "model.embed_tokens_per_layer",
+                QuantizedEmbedding(
+                    embedTokensPerLayer,
+                    groupSize: quantization.groupSize,
+                    bits: quantization.bits,
+                    mode: quantization.mode
+                )
+            ))
+        }
+
         // 4. Update the MoE and MLP parameter overrides inside the layers loop.
         for (i, layer) in self.model.layers.enumerated() {
             // Check MLP
@@ -1006,6 +1027,48 @@ public class Gemma4Model: Module, LLMModel {
                     let quantization = quantizationParameters(for: layerPath, packedWeight: oW, inputDimensions: oProj.weight.shape[1])
                     moduleUpdates.append((layerPath, QuantizedLinear(oProj, groupSize: quantization.groupSize, bits: quantization.bits, mode: quantization.mode)))
                 }
+            }
+
+            if let perLayerInputGate = layer.perLayerInputGate as? Linear,
+               let gateWeight = finalWeights["language_model.model.layers.\(i).per_layer_input_gate.weight"] ?? finalWeights["model.layers.\(i).per_layer_input_gate.weight"],
+               gateWeight.shape.count == 2
+            {
+                let layerPath = "model.layers.\(i).per_layer_input_gate"
+                let quantization = quantizationParameters(
+                    for: layerPath,
+                    packedWeight: gateWeight,
+                    inputDimensions: perLayerInputGate.weight.shape[1]
+                )
+                moduleUpdates.append((
+                    layerPath,
+                    QuantizedLinear(
+                        perLayerInputGate,
+                        groupSize: quantization.groupSize,
+                        bits: quantization.bits,
+                        mode: quantization.mode
+                    )
+                ))
+            }
+
+            if let perLayerProjection = layer.perLayerProjectionLayer as? Linear,
+               let projectionWeight = finalWeights["language_model.model.layers.\(i).per_layer_projection.weight"] ?? finalWeights["model.layers.\(i).per_layer_projection.weight"],
+               projectionWeight.shape.count == 2
+            {
+                let layerPath = "model.layers.\(i).per_layer_projection"
+                let quantization = quantizationParameters(
+                    for: layerPath,
+                    packedWeight: projectionWeight,
+                    inputDimensions: perLayerProjection.weight.shape[1]
+                )
+                moduleUpdates.append((
+                    layerPath,
+                    QuantizedLinear(
+                        perLayerProjection,
+                        groupSize: quantization.groupSize,
+                        bits: quantization.bits,
+                        mode: quantization.mode
+                    )
+                ))
             }
         }
         
