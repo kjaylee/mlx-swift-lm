@@ -11,6 +11,24 @@ import MLXLMCommon
 import MLXNN
 
 public struct Gemma4Configuration: Codable {
+    public struct CheckpointQuantization: Codable, Sendable, Equatable {
+        let groupSize: Int
+        let bits: Int
+        let mode: QuantizationMode
+
+        enum CodingKeys: String, CodingKey {
+            case groupSize = "group_size"
+            case bits
+            case mode
+        }
+
+        init(groupSize: Int, bits: Int, mode: QuantizationMode = .affine) {
+            self.groupSize = groupSize
+            self.bits = bits
+            self.mode = mode
+        }
+    }
+
     let modelType: String
     let hiddenSize: Int
     let hiddenLayers: Int
@@ -47,6 +65,7 @@ public struct Gemma4Configuration: Codable {
     let hiddenSizePerLayerInput: Int
     /// Vocabulary size for per-layer embedding table (0 = disabled)
     let vocabSizePerLayerInput: Int
+    let checkpointQuantization: CheckpointQuantization?
 
     public init(
         modelType: String, hiddenSize: Int, hiddenLayers: Int, intermediateSize: Int,
@@ -60,7 +79,8 @@ public struct Gemma4Configuration: Codable {
         numGlobalKeyValueHeads: Int? = nil,
         hiddenSizePerLayerInput: Int = 0, vocabSizePerLayerInput: Int = 0,
         globalRopePartialFactor: Float = 0.25,
-        finalLogitSoftcapping: Float = 0.0
+        finalLogitSoftcapping: Float = 0.0,
+        checkpointQuantization: CheckpointQuantization? = nil
     ) {
         self.modelType = modelType
         self.hiddenSize = hiddenSize
@@ -91,6 +111,7 @@ public struct Gemma4Configuration: Codable {
         self.vocabSizePerLayerInput = vocabSizePerLayerInput
         self.globalRopePartialFactor = globalRopePartialFactor
         self.finalLogitSoftcapping = finalLogitSoftcapping
+        self.checkpointQuantization = checkpointQuantization
     }
 
     enum CodingKeys: String, CodingKey {
@@ -130,6 +151,8 @@ public struct Gemma4Configuration: Codable {
     // Top-level keys (outside text_config)
     enum TopLevelCodingKeys: String, CodingKey {
         case textConfig = "text_config"
+        case quantization
+        case quantizationConfig = "quantization_config"
     }
 
     enum VLMCodingKeys: String, CodingKey {
@@ -137,6 +160,7 @@ public struct Gemma4Configuration: Codable {
     }
 
     public init(from decoder: Decoder) throws {
+        let topLevelContainer = try decoder.container(keyedBy: TopLevelCodingKeys.self)
         let nestedContainer = try decoder.container(keyedBy: VLMCodingKeys.self)
 
         let container =
@@ -193,6 +217,9 @@ public struct Gemma4Configuration: Codable {
         } else {
             self.globalRopePartialFactor = 0.25  // Gemma 4 default: 128/512
         }
+        self.checkpointQuantization =
+            (try? topLevelContainer.decodeIfPresent(CheckpointQuantization.self, forKey: .quantization))
+            ?? (try? topLevelContainer.decodeIfPresent(CheckpointQuantization.self, forKey: .quantizationConfig))
     }
 }
 
@@ -844,13 +871,63 @@ public class Gemma4Model: Module, LLMModel {
             finalWeights["model.per_layer_projection_norm.weight"] = normWeight
         }
 
+        let defaultQuantization = config.checkpointQuantization
+            ?? Gemma4Configuration.CheckpointQuantization(groupSize: 64, bits: 4, mode: .affine)
+
+        func quantizationParameters(
+            for layerPath: String,
+            packedWeight: MLXArray,
+            inputDimensions: Int
+        ) -> (groupSize: Int, bits: Int, mode: QuantizationMode) {
+            let inferredBits =
+                if inputDimensions > 0, let packedWidth = packedWeight.shape.last, packedWidth > 0 {
+                    max(1, 32 * packedWidth / inputDimensions)
+                } else {
+                    defaultQuantization.bits
+                }
+
+            let inferredGroupSize =
+                if
+                    inputDimensions > 0,
+                    let scaleGroups = finalWeights["\(layerPath).scales"]?.shape.last,
+                    scaleGroups > 0
+                {
+                    max(1, inputDimensions / scaleGroups)
+                } else {
+                    defaultQuantization.groupSize
+                }
+
+            return (
+                groupSize: inferredGroupSize,
+                bits: inferredBits,
+                mode: config.checkpointQuantization?.mode ?? defaultQuantization.mode
+            )
+        }
+
         // Handle mixed-quantization: MLP and MoE experts might be 8-bit while other layers are 4-bit.
         // 3. Setup dynamic layer updates
         var moduleUpdates: [(String, Module)] = []
         
         // Dynamically wrap embed_tokens with QuantizedEmbedding if its shape count indicates packed uint32 (shape is 2, normally shape is 2 anyway but we check for matching scale). Since we know it's a 4-bit A4B model, we just check if scales exist.
-        if let embedScales = processedWeights["model.embed_tokens.scales"], let embedTokens = model.embedTokens as? Embedding {
-            moduleUpdates.append(("model.embed_tokens", QuantizedEmbedding(embedTokens, groupSize: 64, bits: 4)))
+        if
+            finalWeights["model.embed_tokens.scales"] != nil,
+            let embedWeight = finalWeights["model.embed_tokens.weight"],
+            let embedTokens = model.embedTokens as? Embedding
+        {
+            let quantization = quantizationParameters(
+                for: "model.embed_tokens",
+                packedWeight: embedWeight,
+                inputDimensions: embedTokens.weight.shape[1]
+            )
+            moduleUpdates.append((
+                "model.embed_tokens",
+                QuantizedEmbedding(
+                    embedTokens,
+                    groupSize: quantization.groupSize,
+                    bits: quantization.bits,
+                    mode: quantization.mode
+                )
+            ))
         }
 
         // 4. Update the MoE and MLP parameter overrides inside the layers loop.
@@ -859,16 +936,19 @@ public class Gemma4Model: Module, LLMModel {
             let mlp = layer.mlp
             if let gate = mlp.gateProj as? Linear, let down = mlp.downProj as? Linear, let up = mlp.upProj as? Linear {
                 if let w = finalWeights["language_model.model.layers.\(i).mlp.gate_proj.weight"] ?? finalWeights["model.layers.\(i).mlp.gate_proj.weight"], w.shape.count == 2 {
-                    let bits = 32 * w.shape.last! / gate.weight.shape[1]
-                    moduleUpdates.append(("model.layers.\(i).mlp.gate_proj", QuantizedLinear(gate, groupSize: 64, bits: bits)))
+                    let layerPath = "model.layers.\(i).mlp.gate_proj"
+                    let quantization = quantizationParameters(for: layerPath, packedWeight: w, inputDimensions: gate.weight.shape[1])
+                    moduleUpdates.append((layerPath, QuantizedLinear(gate, groupSize: quantization.groupSize, bits: quantization.bits, mode: quantization.mode)))
                 }
                 if let w = finalWeights["language_model.model.layers.\(i).mlp.down_proj.weight"] ?? finalWeights["model.layers.\(i).mlp.down_proj.weight"], w.shape.count == 2 {
-                    let bits = 32 * w.shape.last! / down.weight.shape[1]
-                    moduleUpdates.append(("model.layers.\(i).mlp.down_proj", QuantizedLinear(down, groupSize: 64, bits: bits)))
+                    let layerPath = "model.layers.\(i).mlp.down_proj"
+                    let quantization = quantizationParameters(for: layerPath, packedWeight: w, inputDimensions: down.weight.shape[1])
+                    moduleUpdates.append((layerPath, QuantizedLinear(down, groupSize: quantization.groupSize, bits: quantization.bits, mode: quantization.mode)))
                 }
                 if let w = finalWeights["language_model.model.layers.\(i).mlp.up_proj.weight"] ?? finalWeights["model.layers.\(i).mlp.up_proj.weight"], w.shape.count == 2 {
-                    let bits = 32 * w.shape.last! / up.weight.shape[1]
-                    moduleUpdates.append(("model.layers.\(i).mlp.up_proj", QuantizedLinear(up, groupSize: 64, bits: bits)))
+                    let layerPath = "model.layers.\(i).mlp.up_proj"
+                    let quantization = quantizationParameters(for: layerPath, packedWeight: w, inputDimensions: up.weight.shape[1])
+                    moduleUpdates.append((layerPath, QuantizedLinear(up, groupSize: quantization.groupSize, bits: quantization.bits, mode: quantization.mode)))
                 }
             }
 
@@ -876,16 +956,19 @@ public class Gemma4Model: Module, LLMModel {
             let switchGLU = layer.expertsBlock.switchGLU
             if let gate = switchGLU.gateProj as? SwitchLinear, let down = switchGLU.downProj as? SwitchLinear, let up = switchGLU.upProj as? SwitchLinear {
                 if let w = finalWeights["language_model.model.layers.\(i).experts.switch_glu.gate_proj.weight"] ?? finalWeights["model.layers.\(i).experts.switch_glu.gate_proj.weight"], w.shape.count == 3 {
-                    let bits = 32 * w.shape.last! / gate.weight.shape.last!
-                    moduleUpdates.append(("model.layers.\(i).experts.switch_glu.gate_proj", QuantizedSwitchLinear(gate, groupSize: 64, bits: bits)))
+                    let layerPath = "model.layers.\(i).experts.switch_glu.gate_proj"
+                    let quantization = quantizationParameters(for: layerPath, packedWeight: w, inputDimensions: gate.weight.shape.last!)
+                    moduleUpdates.append((layerPath, QuantizedSwitchLinear(gate, groupSize: quantization.groupSize, bits: quantization.bits, mode: quantization.mode)))
                 }
                 if let w = finalWeights["language_model.model.layers.\(i).experts.switch_glu.down_proj.weight"] ?? finalWeights["model.layers.\(i).experts.switch_glu.down_proj.weight"], w.shape.count == 3 {
-                    let bits = 32 * w.shape.last! / down.weight.shape.last!
-                    moduleUpdates.append(("model.layers.\(i).experts.switch_glu.down_proj", QuantizedSwitchLinear(down, groupSize: 64, bits: bits)))
+                    let layerPath = "model.layers.\(i).experts.switch_glu.down_proj"
+                    let quantization = quantizationParameters(for: layerPath, packedWeight: w, inputDimensions: down.weight.shape.last!)
+                    moduleUpdates.append((layerPath, QuantizedSwitchLinear(down, groupSize: quantization.groupSize, bits: quantization.bits, mode: quantization.mode)))
                 }
                 if let w = finalWeights["language_model.model.layers.\(i).experts.switch_glu.up_proj.weight"] ?? finalWeights["model.layers.\(i).experts.switch_glu.up_proj.weight"], w.shape.count == 3 {
-                    let bits = 32 * w.shape.last! / up.weight.shape.last!
-                    moduleUpdates.append(("model.layers.\(i).experts.switch_glu.up_proj", QuantizedSwitchLinear(up, groupSize: 64, bits: bits)))
+                    let layerPath = "model.layers.\(i).experts.switch_glu.up_proj"
+                    let quantization = quantizationParameters(for: layerPath, packedWeight: w, inputDimensions: up.weight.shape.last!)
+                    moduleUpdates.append((layerPath, QuantizedSwitchLinear(up, groupSize: quantization.groupSize, bits: quantization.bits, mode: quantization.mode)))
                 }
             }
 
@@ -895,26 +978,30 @@ public class Gemma4Model: Module, LLMModel {
             // Check Attention Projections (q, k, v, o)
             if let qW = finalWeights["language_model.model.layers.\(i).self_attn.q_proj.weight"] ?? finalWeights["model.layers.\(i).self_attn.q_proj.weight"], qW.shape.count == 2 {
                 if let qProj = layer.selfAttention.queryProj as? Linear {
-                    let bits = 32 * qW.shape.last! / qProj.weight.shape[1]
-                    moduleUpdates.append(("model.layers.\(i).self_attn.q_proj", QuantizedLinear(qProj, groupSize: 64, bits: bits)))
+                    let layerPath = "model.layers.\(i).self_attn.q_proj"
+                    let quantization = quantizationParameters(for: layerPath, packedWeight: qW, inputDimensions: qProj.weight.shape[1])
+                    moduleUpdates.append((layerPath, QuantizedLinear(qProj, groupSize: quantization.groupSize, bits: quantization.bits, mode: quantization.mode)))
                 }
             }
             if let kW = finalWeights["language_model.model.layers.\(i).self_attn.k_proj.weight"] ?? finalWeights["model.layers.\(i).self_attn.k_proj.weight"], kW.shape.count == 2 {
                 if let kProj = layer.selfAttention.keyProj as? Linear {
-                    let bits = 32 * kW.shape.last! / kProj.weight.shape[1]
-                    moduleUpdates.append(("model.layers.\(i).self_attn.k_proj", QuantizedLinear(kProj, groupSize: 64, bits: bits)))
+                    let layerPath = "model.layers.\(i).self_attn.k_proj"
+                    let quantization = quantizationParameters(for: layerPath, packedWeight: kW, inputDimensions: kProj.weight.shape[1])
+                    moduleUpdates.append((layerPath, QuantizedLinear(kProj, groupSize: quantization.groupSize, bits: quantization.bits, mode: quantization.mode)))
                 }
             }
             if let vW = finalWeights["language_model.model.layers.\(i).self_attn.v_proj.weight"] ?? finalWeights["model.layers.\(i).self_attn.v_proj.weight"], vW.shape.count == 2 {
                 if let vProj = layer.selfAttention.valueProj as? Linear {
-                    let bits = 32 * vW.shape.last! / vProj.weight.shape[1]
-                    moduleUpdates.append(("model.layers.\(i).self_attn.v_proj", QuantizedLinear(vProj, groupSize: 64, bits: bits)))
+                    let layerPath = "model.layers.\(i).self_attn.v_proj"
+                    let quantization = quantizationParameters(for: layerPath, packedWeight: vW, inputDimensions: vProj.weight.shape[1])
+                    moduleUpdates.append((layerPath, QuantizedLinear(vProj, groupSize: quantization.groupSize, bits: quantization.bits, mode: quantization.mode)))
                 }
             }
             if let oW = finalWeights["language_model.model.layers.\(i).self_attn.o_proj.weight"] ?? finalWeights["model.layers.\(i).self_attn.o_proj.weight"], oW.shape.count == 2 {
                 if let oProj = layer.selfAttention.outputProj as? Linear {
-                    let bits = 32 * oW.shape.last! / oProj.weight.shape[1]
-                    moduleUpdates.append(("model.layers.\(i).self_attn.o_proj", QuantizedLinear(oProj, groupSize: 64, bits: bits)))
+                    let layerPath = "model.layers.\(i).self_attn.o_proj"
+                    let quantization = quantizationParameters(for: layerPath, packedWeight: oW, inputDimensions: oProj.weight.shape[1])
+                    moduleUpdates.append((layerPath, QuantizedLinear(oProj, groupSize: quantization.groupSize, bits: quantization.bits, mode: quantization.mode)))
                 }
             }
         }
