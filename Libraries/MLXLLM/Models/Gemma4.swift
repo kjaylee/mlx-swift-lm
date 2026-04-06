@@ -558,7 +558,7 @@ class Gemma4SparseMoeBlock: Module {
 class Gemma4TransformerBlock: Module {
     @ModuleInfo(key: "self_attn") var selfAttention: Gemma4Attention
     @ModuleInfo var mlp: Gemma4MLP
-    @ModuleInfo(key: "experts") var expertsBlock: Gemma4SparseMoeBlock
+    @ModuleInfo(key: "experts") var expertsBlock: Gemma4SparseMoeBlock?
 
     @ModuleInfo(key: "input_layernorm") var inputLayerNorm: RMSNorm
     @ModuleInfo(key: "post_attention_layernorm") var postAttentionLayerNorm: RMSNorm
@@ -600,14 +600,15 @@ class Gemma4TransformerBlock: Module {
         self.mlp = Gemma4MLP(dimensions: config.hiddenSize, hiddenDimensions: mlpSize)
 
         self.isMoe = config.numExperts != nil && config.numExperts! > 0
-        let numExperts = config.numExperts ?? 1
-        
-        self._expertsBlock.wrappedValue = Gemma4SparseMoeBlock(
-            dimensions: config.hiddenSize,
-            numExperts: numExperts,
-            topK: config.topKExperts ?? 1,
-            moeIntermediateSize: config.moeIntermediateSize ?? config.intermediateSize
-        )
+        if self.isMoe {
+            let numExperts = config.numExperts ?? 1
+            self._expertsBlock.wrappedValue = Gemma4SparseMoeBlock(
+                dimensions: config.hiddenSize,
+                numExperts: numExperts,
+                topK: config.topKExperts ?? 1,
+                moeIntermediateSize: config.moeIntermediateSize ?? config.intermediateSize
+            )
+        }
         
         if self.isMoe {
             self._postFeedforwardLayerNorm1.wrappedValue = RMSNorm(dimensions: config.hiddenSize, eps: config.rmsNormEps)
@@ -655,7 +656,7 @@ class Gemma4TransformerBlock: Module {
 
             // Experts evaluate on the DENSE-NORMED sparse stream (llama.cpp `ffn_pre_norm_2`)
             let sparsePreNorm = preFeedforwardLayerNorm2!(routerInput)
-            let sparseOut = expertsBlock(sparsePreNorm, routerInput: routerInput)
+            let sparseOut = expertsBlock!(sparsePreNorm, routerInput: routerInput)
             let sparsePostNorm2 = postFeedforwardLayerNorm2!(sparseOut)
 
             let combined = densePostNorm1 + sparsePostNorm2
@@ -953,8 +954,10 @@ public class Gemma4Model: Module, LLMModel {
             }
 
             // Check Experts switchGLU
-            let switchGLU = layer.expertsBlock.switchGLU
-            if let gate = switchGLU.gateProj as? SwitchLinear, let down = switchGLU.downProj as? SwitchLinear, let up = switchGLU.upProj as? SwitchLinear {
+            if let switchGLU = layer.expertsBlock?.switchGLU,
+               let gate = switchGLU.gateProj as? SwitchLinear,
+               let down = switchGLU.downProj as? SwitchLinear,
+               let up = switchGLU.upProj as? SwitchLinear {
                 if let w = finalWeights["language_model.model.layers.\(i).experts.switch_glu.gate_proj.weight"] ?? finalWeights["model.layers.\(i).experts.switch_glu.gate_proj.weight"], w.shape.count == 3 {
                     let layerPath = "model.layers.\(i).experts.switch_glu.gate_proj"
                     let quantization = quantizationParameters(for: layerPath, packedWeight: w, inputDimensions: gate.weight.shape.last!)
